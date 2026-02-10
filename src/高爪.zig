@@ -7,7 +7,7 @@ const fs = std.fs;
 // --- CONFIG ---
 const ROWS: usize = 24;
 const COLS: usize = 80;
-const VERSION = "v3.10.2 HEX-FIX";
+const VERSION = "v4.0.0 OMNISCOPE";
 
 // --- ANSI PROTOCOL (@NSIBLE-RED) ---
 const C_RESET = "\x1b[0m";
@@ -15,8 +15,8 @@ const C_TAG   = "\x1b[31m";   // CRIMSON (Tags)
 const C_LINK  = "\x1b[33m";   // BRASS (Links)
 const C_TEXT  = "\x1b[37m";   // SILVER (Text)
 const C_SCAN  = "\x1b[7m";    // INVERSE (Scanner Focus)
-const C_BAR   = "\x1b[41;30m";// RED BG / BLACK FG
-const C_META  = "\x1b[36m";   // CYAN (Metadata)
+const C_BAR   = "\x1b[41;30m";// RED BG / BLACK FG (The Red Bar)
+const C_META  = "\x1b[36m";   // CYAN (Metadata Headers)
 const C_LASER = "\x1b[41;37m";// RED BG / WHITE FG (Scan Line)
 
 const PhiloteNode = struct {
@@ -44,6 +44,7 @@ fn rawPrintf(comptime fmt: []const u8, args: anytype) !void {
     try rawPrint(formatted_slice);
 }
 
+// STABLE SLEEP (Uses Poll)
 fn sysSleep(ms: i32) void {
     var fds = [0]posix.pollfd{};
     _ = posix.poll(&fds, ms) catch {};
@@ -128,20 +129,24 @@ const PhiloteEngine = struct {
 
 // --- STATE ---
 const AppState = struct {
-    scope: i8 = 1, 
+    scope: i8 = 1, // 2=Ext, 1=Browser, 0=Meta, -1=Hex
     url: []const u8 = "STANDBY",
     status: []const u8 = "IDLE",
     menu_open: bool = false,
     input_buffer: [256]u8 = undefined,
     input_len: usize = 0,
+    
+    // VIEW STATE
     scroll_y: usize = 0,
     scan_line: usize = 0,
     raw_mode: bool = false, 
     bytes_rx: usize = 0,
+    
+    // HISTORY
     history: std.ArrayListUnmanaged([]u8) = .{},
 };
 
-// --- SPLASH ---
+// --- SPLASH SCREEN ---
 fn drawSplash() !void {
     const LOGO = [_][]const u8{
         "      .---.      ",
@@ -153,6 +158,7 @@ fn drawSplash() !void {
         " @NSIBLE SECURE UPLINK",
         " [|||||||||||||] 100%"
     };
+
     try rawPrint("\x1b[2J\x1b[H\n");
     var i: usize = 0;
     while (i < LOGO.len + 4) : (i += 1) {
@@ -218,10 +224,11 @@ pub fn main() !void {
         }
     }
 
-    // --- TURBO DRAIN ---
+    // --- TURBO DRAIN (Fixes Entry Buffer Issue) ---
     if (fds[1].fd != -1) {
         var net_buf: [4096]u8 = undefined;
         var drain_loop: usize = 0;
+        // Aggressively drain pipe to catch up from Splash delay
         while (drain_loop < 20) : (drain_loop += 1) {
             const count = posix.poll(&fds, 0) catch 0;
             if (count > 0 and (fds[1].revents & posix.POLL.IN != 0)) {
@@ -284,8 +291,10 @@ pub fn main() !void {
                             try navigate(allocator, &state, u, &child_ptr, &fds, &raw_cache, &philote, true);
                         }
                     } else {
-                        // COMMANDS
+                        // --- OMNISCOPE COMMANDS ---
                         if (mem.eql(u8, cmd, "salud")) return;
+                        
+                        // ZOOM
                         if (mem.eql(u8, cmd, "@://z+")) {
                             if (state.scope < 2) {
                                 state.scope += 1;
@@ -299,11 +308,15 @@ pub fn main() !void {
                                 try computeDisplayView(allocator, raw_cache.items, &display_cache, &state);
                             }
                         }
+                        
+                        // VIEW
                         else if (mem.eql(u8, cmd, "@://x+")) { state.raw_mode = true; try computeDisplayView(allocator, raw_cache.items, &display_cache, &state); }
                         else if (mem.eql(u8, cmd, "@://x-")) { state.raw_mode = false; try computeDisplayView(allocator, raw_cache.items, &display_cache, &state); }
+                        
                         else if (mem.eql(u8, cmd, "@://reload")) { try navigate(allocator, &state, state.url, &child_ptr, &fds, &raw_cache, &philote, false); }
                         else if (mem.eql(u8, cmd, "@://back")) { if (state.history.items.len > 1) { _ = state.history.pop(); const prev = state.history.pop().?; try navigate(allocator, &state, prev, &child_ptr, &fds, &raw_cache, &philote, false); } }
                         else if (mem.startsWith(u8, cmd, "@://")) { const target = cmd[4..]; try navigate(allocator, &state, target, &child_ptr, &fds, &raw_cache, &philote, true); }
+                        
                         state.input_len = 0;
                     }
                 } else if (char >= 32 and char <= 126) {
@@ -332,7 +345,7 @@ pub fn main() !void {
     }
 }
 
-// --- LOGIC ---
+// --- CORE LOGIC ---
 
 fn launchDevice(alloc: std.mem.Allocator, url: []const u8) !void {
     const full_url = if (mem.startsWith(u8, url, "http")) url else try std.fmt.allocPrint(alloc, "https://{s}", .{url});
