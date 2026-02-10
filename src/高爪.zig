@@ -5,6 +5,10 @@ const process = std.process;
 const fs = std.fs;
 
 // --- CONFIG ---
+const ROWS: usize = 24;
+const COLS: usize = 80;
+const VERSION = "v3.6.5 RESTORE";
+
 const PhiloteNode = struct {
     url: []u8,
     weight: u32,
@@ -122,8 +126,17 @@ const AppState = struct {
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
+    const stdin_fd = posix.STDIN_FILENO;
 
-    // NUCLEAR INIT
+    // --- RAW MODE INIT ---
+    const original_termios = try posix.tcgetattr(stdin_fd);
+    var raw = original_termios;
+    raw.lflag.ECHO = false;
+    raw.lflag.ICANON = false; 
+    raw.lflag.ISIG = false; 
+    try posix.tcsetattr(stdin_fd, .NOW, raw);
+    defer posix.tcsetattr(stdin_fd, .NOW, original_termios) catch {};
+
     try rawPrint("\x1b[2J\x1b[3J\x1b[H");
 
     var philote = PhiloteEngine.init(allocator);
@@ -135,65 +148,97 @@ pub fn main() !void {
 
     var state = AppState{};
     
-    // Networking State
+    // Networking
     var child_ptr: ?process.Child = null;
     var fds = [2]posix.pollfd{
-        .{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = stdin_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
     };
 
-    // --- ARGS PAYLOAD PARSER (The @nsible Handshake) ---
-    // This block catches the @://url passed by the Bash Pipe
+    // --- ARGS PAYLOAD PARSER ---
     const args = try process.argsAlloc(allocator);
     defer process.argsFree(allocator, args);
-    
     if (args.len > 1) {
         const raw_payload = args[1];
-        // Sanitize any residual quotes from the shell wrapper
         const payload = mem.trim(u8, raw_payload, "'");
-        
         if (mem.startsWith(u8, payload, "@://")) {
             const target = payload[4..];
-            // Update State
             state.url = try allocator.dupe(u8, target);
             state.status = "IGNITING PIPE";
             state.scroll_y = 0;
-            
-            // Hit Database
             try philote.hit(target);
-            
-            // Ignite Uplink Immediately
             try connect(allocator, target, &child_ptr, &fds, &view_cache);
         }
     }
 
-    // Initial Render
     try renderFrame(allocator, &state, view_cache.items, &philote);
 
     while (true) {
         _ = try posix.poll(&fds, -1);
 
-        // --- INPUT (FIXED ITERATOR) ---
+        // --- INPUT LOOP ---
         if (fds[0].revents & posix.POLL.IN != 0) {
             var buf: [128]u8 = undefined;
-            const n = try posix.read(posix.STDIN_FILENO, &buf);
+            const n = try posix.read(stdin_fd, &buf);
             if (n == 0) break;
 
             var i: usize = 0;
             while (i < n) {
-                // ESC SEQUENCE CHECK
-                if (buf[i] == 27 and i + 2 < n) {
-                    if (mem.eql(u8, buf[i..i+3], "\x1b[A")) {
-                        if (state.scroll_y > 0) state.scroll_y -= 1;
-                        i += 3; continue;
+                const char = buf[i];
+
+                // --- THE SILENCER (Escape Trap) ---
+                if (char == 27) {
+                    if (i + 2 < n and buf[i+1] == '[') {
+                        const code = buf[i+2];
+                        if (code == 'A') { 
+                            if (state.scroll_y > 0) state.scroll_y -= 1;
+                            i += 3; continue; 
+                        }
+                        if (code == 'B') { 
+                            state.scroll_y += 1;
+                            i += 3; continue; 
+                        }
+                        if (i + 3 < n and buf[i+3] == '~') {
+                            if (code == '5') { 
+                                if (state.scroll_y >= 20) state.scroll_y -= 20 else state.scroll_y = 0; 
+                            }
+                            if (code == '6') { 
+                                state.scroll_y += 20; 
+                            }
+                            i += 4; continue;
+                        }
+                    } else {
+                        // FRAGMENTATION HANDLER
+                        var seq_buf: [3]u8 = undefined;
+                        const seq_n = try posix.read(stdin_fd, &seq_buf);
+                        if (seq_n > 0 and seq_buf[0] == '[') {
+                            const code = seq_buf[1];
+                            if (code == 'A') {
+                                if (state.scroll_y > 0) state.scroll_y -= 1;
+                            }
+                            if (code == 'B') {
+                                state.scroll_y += 1;
+                            }
+                            if (code == '5' and seq_n >= 3 and seq_buf[2] == '~') {
+                                if (state.scroll_y >= 20) state.scroll_y -= 20 else state.scroll_y = 0;
+                            }
+                            if (code == '6' and seq_n >= 3 and seq_buf[2] == '~') {
+                                state.scroll_y += 20;
+                            }
+                        }
                     }
-                    if (mem.eql(u8, buf[i..i+3], "\x1b[B")) {
-                        state.scroll_y += 1;
-                        i += 3; continue;
-                    }
+                    i += 1; 
+                    continue;
                 }
 
-                const char = buf[i];
+                // --- BACKSPACE RESTORED ---
+                if (char == 127) {
+                    if (state.input_len > 0) state.input_len -= 1;
+                    i += 1;
+                    continue;
+                }
+
+                // Normal Input
                 i += 1;
 
                 if (char == '\t' or char == '`') {
@@ -203,15 +248,12 @@ pub fn main() !void {
 
                 if (char == '\n' or char == '\r') {
                     const cmd = state.input_buffer[0..state.input_len];
-
-                    if (mem.eql(u8, cmd, "salud")) {
+                    if (mem.eql(u8, cmd, "salud") or mem.eql(u8, cmd, "exit")) {
                         if (child_ptr) |*c| { _ = c.kill() catch {}; }
                         try rawPrint("\x1b[2J\x1b[H"); 
                         return;
                     }
-
                     if (mem.eql(u8, cmd, "@://reload")) {
-                        // Just re-render
                     } else if (mem.startsWith(u8, cmd, "@://")) {
                         const target = cmd[4..];
                         state.url = try allocator.dupe(u8, target);
@@ -220,7 +262,6 @@ pub fn main() !void {
                         try connect(allocator, target, &child_ptr, &fds, &view_cache);
                         try philote.hit(target);
                     }
-
                     state.input_len = 0;
                 } else if (char >= 32 and char <= 126) {
                     if (state.input_len < 255) {
@@ -232,7 +273,7 @@ pub fn main() !void {
             try renderFrame(allocator, &state, view_cache.items, &philote);
         }
 
-        // --- NETWORK ---
+        // --- NETWORK LOOP ---
         if (fds[1].fd != -1 and (fds[1].revents & posix.POLL.IN != 0)) {
             var net_buf: [4096]u8 = undefined;
             const bytes = try posix.read(fds[1].fd, &net_buf);
@@ -247,18 +288,16 @@ pub fn main() !void {
     }
 }
 
-// --- FRAMEBUFFER RENDERER ---
+// --- RENDERER ---
 fn renderFrame(alloc: std.mem.Allocator, state: *AppState, content: []const u8, philote: *PhiloteEngine) !void {
     const ws = getTermSize();
     const term_h = ws.row;
     const term_w = ws.col;
     const view_h = if (term_h > 5) term_h - 5 else 5;
 
-    // 1. Reset
     try rawPrint("\x1b[2J\x1b[H");
-    try rawPrint("\x1b[41;30m «高爪 TALON ALTA V3.6.0» \x1b[K\x1b[0m\n");
+    try rawPrint("\x1b[41;30m «高爪 TALON ALTA " ++ VERSION ++ "» \x1b[K\x1b[0m\n");
 
-    // 2. Fill Viewport
     if (state.menu_open) {
         try drawOverlay(philote);
     } else {
@@ -273,7 +312,6 @@ fn renderFrame(alloc: std.mem.Allocator, state: *AppState, content: []const u8, 
         }
     }
 
-    // 3. Pin Footer
     try rawPrintf("\x1b[{d};H", .{term_h - 1});
     try rawPrint("\x1b[41;30m");
     try rawPrintf(" Z:{d} | Y:{d} | {s} | [{s}] \x1b[K", .{ state.zoom, state.scroll_y, state.url, state.status });
@@ -354,8 +392,8 @@ fn drawOverlay(philote: *PhiloteEngine) !void {
     try rawPrint("\x1b[33m|        SYSTEM OVERLAY          |\x1b[0m\n");
     try rawPrint("\x1b[33m+--------------------------------+\x1b[0m\n");
     try rawPrint("| \x1b[1;37mARROWS\x1b[0m    Viewport Scroll      |\n");
+    try rawPrint("| \x1b[1;37mPGUP/DN\x1b[0m   Turbo Scroll         |\n");
     try rawPrint("| \x1b[1;37m@://url\x1b[0m   Fetch New Target     |\n");
-    try rawPrint("| \x1b[1;37m@://reload\x1b[0m Flush View Buffer    |\n");
     try rawPrint("| \x1b[1;37msalud\x1b[0m      Halt Engine          |\n");
     try rawPrint("\x1b[33m+--------------------------------+\x1b[0m\n");
     try rawPrint("\x1b[31m[PHILOTE]\x1b[0m\n");
@@ -367,6 +405,7 @@ fn drawOverlay(philote: *PhiloteEngine) !void {
 fn connect(allocator: std.mem.Allocator, url: []const u8, child_ptr: *?process.Child, fds: *[2]posix.pollfd, cache: *std.ArrayListUnmanaged(u8)) !void {
     cache.clearRetainingCapacity();
     if (child_ptr.*) |*c| { _ = c.kill() catch {}; _ = c.wait() catch {}; child_ptr.* = null; fds[1].fd = -1; }
+    // -N buffer-buster included
     const argv = [_][]const u8{ "curl", "-s", "-L", "-i", "-k", "-N", url };
     var child = process.Child.init(&argv, allocator);
     child.stdout_behavior = .Pipe;
