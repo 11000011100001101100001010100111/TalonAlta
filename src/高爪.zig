@@ -15,7 +15,7 @@ fn rawWrite(fd: i32, data: []const u8) !void {
     var index: usize = 0;
     while (index < data.len) {
         const written = try posix.write(fd, data[index..]);
-        if (written == 0) return; 
+        if (written == 0) return;
         index += written;
     }
 }
@@ -111,18 +111,19 @@ const PhiloteEngine = struct {
 const AppState = struct {
     zoom: u8 = 2,
     url: []const u8 = "STANDBY",
-    status: []const u8 = "IDLE", 
+    status: []const u8 = "IDLE",
     menu_open: bool = false,
     input_buffer: [256]u8 = undefined,
     input_len: usize = 0,
     scroll_y: usize = 0,
 };
 
+// --- MAIN ---
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
-    
-    // NUCLEAR INIT: Clear Screen + Scrollback + Home
+
+    // NUCLEAR INIT
     try rawPrint("\x1b[2J\x1b[3J\x1b[H");
 
     var philote = PhiloteEngine.init(allocator);
@@ -133,13 +134,41 @@ pub fn main() !void {
     defer view_cache.deinit(allocator);
 
     var state = AppState{};
-    try renderFrame(allocator, &state, view_cache.items, &philote);
-
+    
+    // Networking State
     var child_ptr: ?process.Child = null;
     var fds = [2]posix.pollfd{
         .{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN, .revents = 0 },
-        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, 
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
     };
+
+    // --- ARGS PAYLOAD PARSER (The @nsible Handshake) ---
+    // This block catches the @://url passed by the Bash Pipe
+    const args = try process.argsAlloc(allocator);
+    defer process.argsFree(allocator, args);
+    
+    if (args.len > 1) {
+        const raw_payload = args[1];
+        // Sanitize any residual quotes from the shell wrapper
+        const payload = mem.trim(u8, raw_payload, "'");
+        
+        if (mem.startsWith(u8, payload, "@://")) {
+            const target = payload[4..];
+            // Update State
+            state.url = try allocator.dupe(u8, target);
+            state.status = "IGNITING PIPE";
+            state.scroll_y = 0;
+            
+            // Hit Database
+            try philote.hit(target);
+            
+            // Ignite Uplink Immediately
+            try connect(allocator, target, &child_ptr, &fds, &view_cache);
+        }
+    }
+
+    // Initial Render
+    try renderFrame(allocator, &state, view_cache.items, &philote);
 
     while (true) {
         _ = try posix.poll(&fds, -1);
@@ -149,11 +178,10 @@ pub fn main() !void {
             var buf: [128]u8 = undefined;
             const n = try posix.read(posix.STDIN_FILENO, &buf);
             if (n == 0) break;
-            
-            // Iterate ALL bytes to catch pasted commands
+
             var i: usize = 0;
             while (i < n) {
-                // ESC SEQUENCE CHECK (Arrows)
+                // ESC SEQUENCE CHECK
                 if (buf[i] == 27 and i + 2 < n) {
                     if (mem.eql(u8, buf[i..i+3], "\x1b[A")) {
                         if (state.scroll_y > 0) state.scroll_y -= 1;
@@ -175,25 +203,25 @@ pub fn main() !void {
 
                 if (char == '\n' or char == '\r') {
                     const cmd = state.input_buffer[0..state.input_len];
-                    
+
                     if (mem.eql(u8, cmd, "salud")) {
                         if (child_ptr) |*c| { _ = c.kill() catch {}; }
-                        try rawPrint("\x1b[2J\x1b[H"); // Clean exit
+                        try rawPrint("\x1b[2J\x1b[H"); 
                         return;
                     }
-                    
+
                     if (mem.eql(u8, cmd, "@://reload")) {
                         // Just re-render
                     } else if (mem.startsWith(u8, cmd, "@://")) {
                         const target = cmd[4..];
                         state.url = try allocator.dupe(u8, target);
-                        state.scroll_y = 0; 
+                        state.scroll_y = 0;
                         state.status = "FETCHING";
                         try connect(allocator, target, &child_ptr, &fds, &view_cache);
                         try philote.hit(target);
                     }
-                    
-                    state.input_len = 0; // Reset
+
+                    state.input_len = 0;
                 } else if (char >= 32 and char <= 126) {
                     if (state.input_len < 255) {
                         state.input_buffer[state.input_len] = char;
@@ -201,7 +229,6 @@ pub fn main() !void {
                     }
                 }
             }
-            // Render once per batch
             try renderFrame(allocator, &state, view_cache.items, &philote);
         }
 
@@ -209,9 +236,9 @@ pub fn main() !void {
         if (fds[1].fd != -1 and (fds[1].revents & posix.POLL.IN != 0)) {
             var net_buf: [4096]u8 = undefined;
             const bytes = try posix.read(fds[1].fd, &net_buf);
-            if (bytes == 0) { 
+            if (bytes == 0) {
                 fds[1].fd = -1;
-                state.status = "IDLE"; 
+                state.status = "IDLE";
             } else {
                 try view_cache.appendSlice(allocator, net_buf[0..bytes]);
             }
@@ -225,21 +252,20 @@ fn renderFrame(alloc: std.mem.Allocator, state: *AppState, content: []const u8, 
     const ws = getTermSize();
     const term_h = ws.row;
     const term_w = ws.col;
-    const view_h = if (term_h > 5) term_h - 5 else 5; 
+    const view_h = if (term_h > 5) term_h - 5 else 5;
 
     // 1. Reset
-    try rawPrint("\x1b[2J\x1b[H"); 
-    try rawPrint("\x1b[41;30m «高爪 TALON ALTA V3.6.0» \x1b[K\x1b[0m\n"); 
+    try rawPrint("\x1b[2J\x1b[H");
+    try rawPrint("\x1b[41;30m «高爪 TALON ALTA V3.6.0» \x1b[K\x1b[0m\n");
 
     // 2. Fill Viewport
     if (state.menu_open) {
         try drawOverlay(philote);
     } else {
         if (content.len > 0) {
-            // Use Grid Renderer
             try renderGrid(alloc, content, state.scroll_y, view_h, term_w, state.zoom);
         } else {
-            if (mem.eql(u8, state.status, "FETCHING")) {
+            if (mem.eql(u8, state.status, "FETCHING") or mem.eql(u8, state.status, "IGNITING PIPE")) {
                 try rawPrint("\n\n   \x1b[90m[IGNITING...] Stream Active\x1b[0m\n");
             } else {
                 try rawPrint("\n\n   \x1b[90m[STANDBY] TAB for Menu | @:// to Ignite\x1b[0m\n");
@@ -249,19 +275,18 @@ fn renderFrame(alloc: std.mem.Allocator, state: *AppState, content: []const u8, 
 
     // 3. Pin Footer
     try rawPrintf("\x1b[{d};H", .{term_h - 1});
-    try rawPrint("\x1b[41;30m"); 
+    try rawPrint("\x1b[41;30m");
     try rawPrintf(" Z:{d} | Y:{d} | {s} | [{s}] \x1b[K", .{ state.zoom, state.scroll_y, state.url, state.status });
-    try rawPrint("\x1b[0m\n\x1b[1;37m> \x1b[0m"); 
+    try rawPrint("\x1b[0m\n\x1b[1;37m> \x1b[0m");
     if (state.input_len > 0) try rawPrint(state.input_buffer[0..state.input_len]);
 }
 
 fn renderGrid(alloc: std.mem.Allocator, data: []const u8, scroll_y: usize, max_h: usize, max_w: u16, zoom: u8) !void {
-    // Colors
     const C_RESET = "\x1b[0m";
     const C_TAG = "\x1b[90m";
     const C_TEXT = "\x1b[1;37m";
     const C_LINK = "\x1b[4;31m";
-    
+
     var current_line: usize = 0;
     var col: u16 = 0;
     var lines_rendered: usize = 0;
@@ -271,12 +296,10 @@ fn renderGrid(alloc: std.mem.Allocator, data: []const u8, scroll_y: usize, max_h
     defer out.deinit(alloc);
 
     for (data, 0..) |b, i| {
-        // Skip hidden lines
         if (current_line < scroll_y) {
             if (b == '\n') { current_line += 1; col = 0; }
             else {
                 col += 1;
-                // Soft wrap count
                 if (col >= max_w) { current_line += 1; col = 0; }
             }
             continue;
@@ -284,7 +307,6 @@ fn renderGrid(alloc: std.mem.Allocator, data: []const u8, scroll_y: usize, max_h
 
         if (lines_rendered >= max_h) break;
 
-        // Newline
         if (b == '\n') {
             try out.append(alloc, b);
             lines_rendered += 1;
@@ -292,7 +314,6 @@ fn renderGrid(alloc: std.mem.Allocator, data: []const u8, scroll_y: usize, max_h
             continue;
         }
 
-        // Hard Wrap at Edge to prevent terminal double-newline
         if (col >= max_w) {
             try out.append(alloc, '\n');
             lines_rendered += 1;
@@ -304,7 +325,6 @@ fn renderGrid(alloc: std.mem.Allocator, data: []const u8, scroll_y: usize, max_h
 
         if (zoom == 3) { try out.append(alloc, b); continue; }
 
-        // Logic
         if (b == '<') {
             try out.appendSlice(alloc, C_RESET);
             try out.appendSlice(alloc, C_TAG);
@@ -312,9 +332,9 @@ fn renderGrid(alloc: std.mem.Allocator, data: []const u8, scroll_y: usize, max_h
             if (i + 1 < data.len) {
                 const n = data[i+1];
                 if (n == 'a' or n == 'A') {
-                    context = 1; 
-                } else if (n == '/') { 
-                    context = 0; 
+                    context = 1;
+                } else if (n == '/') {
+                    context = 0;
                 }
             }
         } else if (b == '>') {
@@ -326,7 +346,6 @@ fn renderGrid(alloc: std.mem.Allocator, data: []const u8, scroll_y: usize, max_h
             try out.append(alloc, b);
         }
     }
-    
     try rawPrint(out.items);
 }
 
@@ -346,9 +365,9 @@ fn drawOverlay(philote: *PhiloteEngine) !void {
 }
 
 fn connect(allocator: std.mem.Allocator, url: []const u8, child_ptr: *?process.Child, fds: *[2]posix.pollfd, cache: *std.ArrayListUnmanaged(u8)) !void {
-    cache.clearRetainingCapacity(); 
+    cache.clearRetainingCapacity();
     if (child_ptr.*) |*c| { _ = c.kill() catch {}; _ = c.wait() catch {}; child_ptr.* = null; fds[1].fd = -1; }
-    const argv = [_][]const u8{ "curl", "-s", "-L", "-i", "-k", url };
+    const argv = [_][]const u8{ "curl", "-s", "-L", "-i", "-k", "-N", url };
     var child = process.Child.init(&argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
