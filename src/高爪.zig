@@ -7,7 +7,7 @@ const fs = std.fs;
 // --- CONFIG ---
 const ROWS: usize = 24;
 const COLS: usize = 80;
-const VERSION = "v4.1.0 SCRIBE";
+const VERSION = "v4.2.0 HUNTER+";
 
 // --- ANSI PROTOCOL (@NSIBLE-RED) ---
 const C_RESET = "\x1b[0m";
@@ -173,14 +173,23 @@ fn drawSplash() !void {
     sysSleep(200);
 }
 
-// --- IO ---
+// --- IO & UTILS ---
 fn saveLoot(alloc: std.mem.Allocator, name: []const u8, data: []const u8, binary: bool) !void {
-    fs.cwd().makeDir("loot") catch {}; // Ensure dir exists
+    fs.cwd().makeDir("loot") catch {}; 
     const ext = if (binary) ".bin" else ".txt";
     const filename = try std.fmt.allocPrint(alloc, "loot/{s}{s}", .{name, ext});
     const file = try fs.cwd().createFile(filename, .{});
     defer file.close();
     try file.writeAll(data);
+}
+
+fn urlEncode(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    for (input) |c| {
+        if (c == ' ') { try out.appendSlice(alloc, "%20"); }
+        else { try out.append(alloc, c); }
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 // --- MAIN ---
@@ -313,18 +322,27 @@ pub fn main() !void {
                         else if (mem.eql(u8, cmd, "@://x-")) { state.raw_mode = false; try computeDisplayView(allocator, raw_cache.items, &display_cache, &state); }
                         else if (mem.eql(u8, cmd, "@://reload")) { try navigate(allocator, &state, state.url, &child_ptr, &fds, &raw_cache, &philote, false); }
                         
-                        // --- SCRIBE: SAVE COMMAND ---
                         else if (mem.startsWith(u8, cmd, "@://save ")) {
                             const name = cmd[9..];
-                            // If scope is -1, save BINARY. Else save TEXT.
                             const is_bin = (state.scope == -1);
-                            // We save the RAW cache (the source truth), not the display
-                            saveLoot(allocator, name, raw_cache.items, is_bin) catch {
-                                state.status = "SAVE FAILED";
-                            };
+                            saveLoot(allocator, name, raw_cache.items, is_bin) catch { state.status = "SAVE FAILED"; };
                             state.status = "LOOT SECURED";
                         }
                         
+                        // --- HUNTER COMMANDS ---
+                        else if (mem.startsWith(u8, cmd, "@://w ")) {
+                            const query = cmd[6..];
+                            const encoded = try urlEncode(allocator, query);
+                            const target = try std.fmt.allocPrint(allocator, "https://en.wikipedia.org/wiki/Special:Search?search={s}", .{encoded});
+                            try navigate(allocator, &state, target, &child_ptr, &fds, &raw_cache, &philote, true);
+                        }
+                        else if (mem.startsWith(u8, cmd, "@://? ")) {
+                            const query = cmd[6..];
+                            const encoded = try urlEncode(allocator, query);
+                            const target = try std.fmt.allocPrint(allocator, "https://lite.duckduckgo.com/lite/?q={s}", .{encoded});
+                            try navigate(allocator, &state, target, &child_ptr, &fds, &raw_cache, &philote, true);
+                        }
+
                         else if (mem.eql(u8, cmd, "@://back")) { if (state.history.items.len > 1) { _ = state.history.pop(); const prev = state.history.pop().?; try navigate(allocator, &state, prev, &child_ptr, &fds, &raw_cache, &philote, false); } }
                         else if (mem.startsWith(u8, cmd, "@://")) { const target = cmd[4..]; try navigate(allocator, &state, target, &child_ptr, &fds, &raw_cache, &philote, true); }
                         state.input_len = 0;
@@ -438,7 +456,7 @@ fn findNextLink(data: []const u8, current_line: usize) usize {
     var iter = mem.splitScalar(u8, data, '\n');
     while (iter.next()) |line| {
         if (line_idx > current_line) {
-            if (mem.indexOf(u8, line, "http") != null or mem.indexOf(u8, line, "@://") != null) return line_idx;
+            if (mem.indexOf(u8, line, "http") != null or mem.indexOf(u8, line, "@://") != null or mem.indexOf(u8, line, "href=\"/") != null) return line_idx;
         }
         line_idx += 1;
     }
@@ -452,7 +470,7 @@ fn findPrevLink(data: []const u8, current_line: usize) usize {
     var last_link_line: usize = 0;
     while (iter.next()) |line| {
         if (line_idx >= current_line) break;
-        if (mem.indexOf(u8, line, "http") != null or mem.indexOf(u8, line, "@://") != null) last_link_line = line_idx;
+        if (mem.indexOf(u8, line, "http") != null or mem.indexOf(u8, line, "@://") != null or mem.indexOf(u8, line, "href=\"/") != null) last_link_line = line_idx;
         line_idx += 1;
     }
     return last_link_line;
@@ -487,6 +505,15 @@ fn extractUrlFromLine(alloc: std.mem.Allocator, data: []const u8, target_line: u
                     if (c == ' ' or c == '"') break;
                 }
                  return alloc.dupe(u8, line[start+4..end]) catch null;
+            }
+            if (mem.indexOf(u8, line, "href=\"/")) |start| {
+                const actual_start = start + 6; 
+                var end = actual_start;
+                while (end < line.len) : (end += 1) {
+                    if (line[end] == '"') break;
+                }
+                const relative = line[actual_start..end];
+                return std.fmt.allocPrint(alloc, "https://en.wikipedia.org{s}", .{relative}) catch null;
             }
             return null;
         }
@@ -563,9 +590,15 @@ fn renderGrid(alloc: std.mem.Allocator, data: []const u8, scroll_y: usize, scan_
         if (b == '\n') {
             if (is_scanning) try out.appendSlice(alloc, C_RESET);
             try out.append(alloc, b);
+            // --- SCAN LOCK FIX ---
+            try out.appendSlice(alloc, C_RESET); // Force reset at EOL
+            // ---------------------
             lines_rendered += 1; current_line += 1; col = 0;
             is_scanning = (current_line == scan_line);
-            if (lines_rendered < max_h) { if (is_scanning) try out.appendSlice(alloc, C_SCAN); if (context == 1) try out.appendSlice(alloc, C_LINK) else try out.appendSlice(alloc, C_TEXT); }
+            if (lines_rendered < max_h) { 
+                if (is_scanning) try out.appendSlice(alloc, C_SCAN); 
+                if (context == 1) try out.appendSlice(alloc, C_LINK) else try out.appendSlice(alloc, C_TEXT); 
+            }
             continue;
         }
 
